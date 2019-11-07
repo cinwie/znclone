@@ -1,0 +1,427 @@
+#!/usr/bin/env python3.6
+# -*- coding: utf-8 -*-
+# ZNCClone Bot v17.11.19
+# Copyright (C) 2017 Nathaniel Olsen
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import atexit
+import json
+import logging
+import random
+import socket
+import ssl
+import sys
+import time
+import warnings
+import os
+import string
+import re
+from platform import python_version
+from shutil import copyfile
+from collections import defaultdict
+
+warnings.simplefilter('default')
+
+try:
+    configarg = sys.argv[1]
+except:
+    print("Error: Please specify your configuration file in the system arguments.")
+    sys.exit("Example: ./bot config.json")
+
+with open(configarg) as f:
+    config = json.load(f)
+try:
+    with open("cache.json") as g:
+        cache = json.load(g)
+except FileNotFoundError:
+    copyfile('examplejsons/cache.json.example', 'cache.json')
+    with open("cache.json") as g:
+        cache = json.load(g)
+try:
+    with open("zncusersdb.json") as b:
+        zncusersdb = json.load(b)
+except FileNotFoundError:
+    copyfile('examplejsons/zncusersdb.json.example', 'zncusersdb.json')
+    with open("zncusersdb.json") as b:
+        zncusersdb = json.load(b)
+try:
+    with open("zncuserlist.json") as n:
+        zncuserlist = json.load(n)
+except FileNotFoundError:
+    copyfile('examplejsons/zncuserlist.json.example', 'zncuserlist.json')
+    with open("zncuserlist.json") as n:
+        zncuserlist = json.load(n)
+
+try:
+    with open("userlang.json") as p:
+        userlang = json.load(p)
+except FileNotFoundError:
+    copyfile('examplejsons/userlang.json.example', 'userlang.json')
+    with open("userlang.json") as p:
+        userlang = json.load(p)
+
+with open("i18n/{}.json".format(config['language'])) as h:
+    i18n = json.load(h)
+
+logging_level = logging.DEBUG  # Sets the logging level (valid options are DEBUG, INFO, WARNING, ERROR and CRITICAL)
+
+logging.basicConfig(level=logging_level)
+
+
+class TokenBucket(object):
+    """An implementation of the token bucket algorithm.
+
+    >>> bucket = TokenBucket(80, 0.5)
+    >>> bucket.consume(1)
+    """
+
+    def __init__(self, tokens, fill_rate):
+        """tokens is the total tokens in the bucket. fill_rate is the
+        rate in tokens/second that the bucket will be refilled."""
+        self.capacity = float(tokens)
+        self._tokens = float(tokens)
+        self.fill_rate = float(fill_rate)
+        self.timestamp = time.time()
+
+    def consume(self, tokens):
+        """Consume tokens from the bucket. Returns True if there were
+        sufficient tokens otherwise False."""
+        if tokens <= self.tokens:
+            self._tokens -= tokens
+            return True
+        return False
+
+    @property
+    def tokens(self):
+        now = time.time()
+        if self._tokens < self.capacity:
+            delta = self.fill_rate * (now - self.timestamp)
+            self._tokens = min(self.capacity, self._tokens + delta)
+        self.timestamp = now
+        return self._tokens
+
+
+tokenbucket = TokenBucket(4, 0.5)
+
+
+def irc_command(command, *args):
+    last_arg = args[-1]
+    other_args = args[:-1]
+
+    return "{} {} :{}\r\n".format(command, " ".join(other_args), last_arg)
+
+
+def sendraw(msg):
+    while not tokenbucket.consume(1):
+        time.sleep(0.1)
+
+    ircsock.sendall(bytes(msg, "utf-8"))
+
+def ping(arg):
+    sendraw(irc_command("PONG", arg))
+
+def acs_normal(message):
+    return True
+
+def wildcards_to_regex(s):
+    return re.sub(r'\\\*', '.*', re.sub(r'\\\?', '.', re.escape(s)))
+
+def wildcard_match(pattern, s):
+    return bool(re.fullmatch(wildcards_to_regex(pattern), s))
+
+def acs_admin(message):
+    return any(wildcard_match(admin, message['userhost']) for admin in config['admins'])
+
+def cmd_restart(message, _):
+    sendmsg(message['replyto'], "Restarting...")
+    cache["channel"] = str(message['replyto'])
+    with open('cache.json', 'w') as g:
+            json.dump(cache, g, indent=2)
+    logging.info("{0} has issued a restart".format(message['nick']))
+    os.execl(sys.executable, sys.executable, * sys.argv)
+
+def sendmsg(chan, msg):
+    global lastchan
+    lastchan = chan
+    logging.debug("sendmsg to {0} (' {1} ')".format(chan, msg))
+    sendraw(irc_command("PRIVMSG", chan, msg))
+
+def cmd_deluser(message, znc_username):
+    znc_username_string = ''.join(znc_username)
+    try:
+        if znc_username_string.lower() in zncuserlist["main"]:
+            zncuserlist["main"].remove(znc_username_string.lower())
+            znc_username_real = zncusersdb["users"][znc_username_string.lower()]["real_username"]
+            sendraw("ZNC *controlpanel DelUser" + " " + str(znc_username_real) + "\n")
+            zncusersdb["users"][znc_username_string.lower()]["state"] = "Deleted"
+            sendmsg(message['replyto'], message['nick'] +": {0} {1} {2}".format(i18n['user'], str(znc_username_string.lower()), i18n['OK_deleted']))
+            with open("zncuserlist.json", 'w') as n:
+                json.dump(zncuserlist, n, indent=2)
+            with open('zncusersdb.json', 'w') as f:
+                json.dump(zncusersdb, f, indent=2)
+        else:
+            sendmsg(message['replyto'], message['nick'] +": {0} {1} {2}".format(i18n['error_user'], str(znc_username_string.lower()),i18n["either_deleted_or_404"]))
+    except KeyError:
+        sendmsg(message['replyto'], message['nick'] +": {0} {1} {2}".format(i18n['error_user'], str(znc_username_string.lower()), i18n["either_deleted_or_404"]))
+
+def zncrequest(message, cmd_args):
+    nick_formatted1 = re.sub(r'\x03\d{1,2}(?:,\d{1,2})?', '', str(cmd_args[0]))
+    nick_formatted2 = re.sub(r'\x02|\x03|\x16|\x1D|\x1F', '', nick_formatted1)
+    nick_formatted3 = re.sub(r'\x02|\x03|\x16|\x1D|\x1F', '', str(cmd_args[1]))
+ #   sendmsg(message['replyto'], message['nick'] +": {0}".format(i18n['create_account_send_details']))
+    length = 10
+    chars = string.ascii_letters + string.digits
+    random.seed = (os.urandom(2048))
+    key = ''.join(random.choice(chars) for i in range(length))
+    sendraw("ZNC *controlpanel CloneUser cloneuser {0}\n".format(nick_formatted2))
+    sendraw("ZNC *controlpanel set password {0} {1}\n".format(nick_formatted2, key))
+    sendraw("ZNC *controlpanel set nick {0} {1}\n".format(nick_formatted2, nick_formatted2))
+    sendraw("ZNC *controlpanel set altnick {0} {1}\n".format(nick_formatted2, nick_formatted2))
+    sendraw("ZNC *controlpanel set ident {0} {1}\n".format(nick_formatted2, nick_formatted2))
+    sendraw("ZNC *controlpanel set realname {0} {1}\n".format(nick_formatted2, nick_formatted2))
+    sendmsg(message['replyto'], "{0} {1}".format(i18n['account_created'], nick_formatted2))
+
+ #   sendmsg(message['nick'], "{0}".format(i18n['account_created']))
+ #   sendmsg(message['nick'], "{0} {1}".format(i18n['username'], nick_formatted2))
+ #   sendmsg(message['nick'], "{0} {1}".format(i18n['password'], key))
+ #   sendmsg(message['nick'], "{0}".format(i18n['recommend_chg_pass_note']))
+ #   sendmsg(message['nick'], "{0} {1}".format(i18n['webpanel'], config['webpanel']))
+#    if len(config['zncircport']) <= 0:
+#        sendmsg(message['nick'], "IRC: {0}, port {1} for SSL, or {2} for standard.".format(config['zncircserver'], config['zncssl'], config['zncstandard']))
+#    elif len(config['zncircportisssl']) > 0:
+#        if config["zncircportisssl"] == "True":
+#            sendmsg(message['nick'], "IRC: {0}, port {1} (SSL is supported)".format(config['zncircserver'], config['zncircport']))
+#        elif config["zncircportisssl"] == "False":
+#            sendmsg(message['nick'], "IRC: {0}, port {1} (SSL isn't supported)".format(config['zncircserver'], config['zncircport']))
+    if len(config['torhs']) >= 2:
+        sendmsg(message['nick'], "({0}, {1})".format(i18n['announce_hs'], config['torhs']))
+    if config['disableapproval'] == "False":
+        sendmsg(message['nick'], "{0}".format(i18n['note_account_require_approval']))
+        sendmsg(message['nick'], "{0}".format(i18n["note_account_require_approval2"]))
+        sendmsg(message['nick'], "{0}".format(i18n["note_account_require_approval3"]))
+    if len(config['linktotos']) > 1:
+        sendmsg(message['nick'], "{0} {1}".format(i18n['info_about_tos'], config['linktotos']))
+    zncusersdb["users"][nick_formatted2.lower()] = {}
+    if config['disableapproval'] == "True":
+        zncusersdb["users"][nick_formatted2.lower()]["state"] = "Approved"
+#        sendraw("ZNC *controlpanel set bindhost {0} {1}\n".format(str(nick_formatted2), config['znchost'] + str(nick_formatted3)))
+        sendraw("ZNC *controlpanel set bindhost {0} {1}\n".format(str(nick_formatted2), str(nick_formatted3)))
+    else:
+        zncusersdb["users"][nick_formatted2.lower()]["state"] = "Pending"
+    zncusersdb["users"][nick_formatted2.lower()]["real_username"] = str(nick_formatted2)
+    zncusersdb["users"][nick_formatted2.lower()]["nick_registered_as"] = str(message['nick'])
+    zncusersdb["users"][nick_formatted2.lower()]["userhost_registered_as"] = str(message['userhost'])
+    zncusersdb["users"][nick_formatted2.lower()]["host_registered_as"] = str(message['host'])
+    zncusersdb["users"][nick_formatted2.lower()]["date_registered"] = str(time.ctime(int(time.time())))
+    zncusersdb["users"][nick_formatted2.lower()]["onlinecount"] = 0
+    zncusersdb["users"][nick_formatted2.lower()]["isonline"] = False
+    with open('zncusersdb.json', 'w') as b:
+        json.dump(zncusersdb, b, indent=2)
+    cache['lastrequest'] = int(time.time())
+    with open('cache.json', 'w') as g:
+        json.dump(cache, g, indent=2)
+    zncuserlist["main"].append(nick_formatted2.lower())
+    with open("zncuserlist.json", 'w') as n:
+        json.dump(zncuserlist, n, indent=2)
+
+def cmd_request(message, cmd_args):
+    cache['already_alerted_bug'] = False
+    with open('cache.json', 'w') as g:
+        json.dump(cache, g, indent=2)
+    try:
+       if time.time() < cache['lastrequest'] + 10:
+           sendmsg(message['replyto'], message['nick'] +": {0}".format(i18n['global_requestthrottle_error']))
+           cache['already_alerted_bug'] = True
+           with open('cache.json', 'w') as g:
+               json.dump(cache, g, indent=2)
+    except KeyError:
+        pass
+    if "#" not in message['replyto']:
+        sendmsg(message['nick'], "{0} {1} {2}".format(i18n['join_channel_error'], config['reqchan'], i18n['to_use_request_command']))
+    elif len(cmd_args) <= 0:
+        sendmsg(message['replyto'], message['nick'] +": {0} \x1f{1}\x1f".format(i18n['request_syntax'], i18n['username_without_comma']))
+    elif cmd_args[0].lower() in zncuserlist['main']:
+        sendmsg(message['replyto'], message['nick'] +": Error: The username {0} is already taken!".format(cmd_args[0]))
+    elif " " in cmd_args[0] or "/" in cmd_args[0] or "[" in cmd_args[0] or "]" in cmd_args[0] or "|" in cmd_args[0]:
+        sendmsg(message['replyto'], message['nick'] +": Error: Please enter a more valid username.")
+    else:
+        zncrequest(message, cmd_args)
+
+def parse_ircmsg(rawmsg):
+    tmp = rawmsg.split(' :', 1)
+    message = tmp[0].split(' ')
+
+    if len(tmp) > 1:
+        message.append(tmp[1])
+
+    nick = None
+    user = None
+    host = None
+    userhost = None
+
+    prefix = None
+    if message[0][0] == ':':
+        prefix = message.pop(0)
+        tmp = prefix.split('!', 1)
+        if len(tmp) > 1:
+            nick = tmp[0][1:]
+            userhost = tmp[1]
+            tmp = tmp[1].split('@', 1)
+            user = tmp[0]
+            if len(tmp) > 1:
+                host = tmp[1]
+
+    parsed = dict(nick=nick, user=user, host=host, userhost=userhost, prefix=prefix,
+                  command=message[0], args=message[1:])
+
+    # convenience for PRIVMSGs
+    parsed['replyto'] = parsed['args'][0]
+    if len(parsed['replyto']) < 2:
+        pass
+    else:
+        if parsed['replyto'][0] != '#':
+            parsed['replyto'] = parsed['nick']
+
+    return parsed
+
+if "+" in config['port']:
+    converted_port = config['port'].replace('+','')
+    ircsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ircsock.connect((config['server'], int(converted_port)))
+    ircsock = ssl.wrap_socket(ircsock)
+else:
+    ircsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ircsock.connect((config['server'], int(config['port'])))
+
+
+atexit.register(ircsock.close)
+
+sendraw(irc_command("USER", config['zncuser'], config['zncuser'], config['zncuser'], 'ZNCClone make & utility bot'))
+
+sendraw(irc_command("NICK", config['zncuser']))
+
+sendraw(irc_command("PASS", "{0}/{1}:{2}\n".format(config['zncuser'], config['network'], config['zncpass'])))
+
+lines = []
+while True:
+    ircmsg = ''
+    if len(lines) <= 1:
+        rawmsg = ''
+        if len(lines) == 1:
+            rawmsg = lines.pop()
+        rawmsg += ircsock.recv(2048).decode("utf-8", "replace")
+        lines += rawmsg.split('\r\n')
+
+    if len(lines) > 1:
+        ircmsg = lines.pop(0)
+    else:
+        continue
+
+    if logging_level == logging.DEBUG:
+        logging.debug("RECV: " + ircmsg)
+    else:
+        pass
+
+    message = parse_ircmsg(ircmsg)
+
+    if message['command'] == 'PING':
+        ping(' '.join(message['args']))
+
+    elif message['command'] == '376':
+        if config['use_identify-msg'] == "True":
+            sendraw("znc *send_raw server znc {0} cap req identify-msg\n".format(config['network']))
+
+    elif message['command'] == "JOIN":
+        if len(cache['channel']) >= 1:
+            sendraw("PRIVMSG {0} :Restart completed!\n".format(cache['channel']))
+            cache['channel'] = ""
+            with open('cache.json', 'w') as g:
+                json.dump(cache, g, indent=2)
+
+    elif message['command'] == 'ERROR':
+        sys.exit(0)
+
+    elif message['args'][-1] == '\x01VERSION\x01':
+       sendraw("NOTICE {0} :\x01VERSION ZNCClone Utility-ish IRC bot, running on Python {1}\x01\r\n".format(message['nick'], python_version()))
+
+    elif message['args'][-1] == '\x01TIME\x01':
+       sendraw("NOTICE {0} :\x01TIME {1}\x01\r\n".format(message['nick'], time.strftime("%c, %Z")))
+
+    elif message['command'] == 'NOTICE':
+        notice_args = message['args'][-1].split(' ')
+
+        if len(notice_args) == 0:
+            continue
+
+    elif message['command'] == 'PRIVMSG':
+        command = None
+        access = acs_normal
+
+        cmd_args = message['args'][-1].split(' ')
+
+        if len(cmd_args) == 0:
+            continue
+
+        wanted_char = "!"
+
+        if config['use_identify-msg'] == "True":
+            user_registered = cmd_args[0][0]
+            try:
+                used_char = cmd_args[0][1]
+            except IndexError:
+                pass
+            command_word = cmd_args[0].lower()[2:]
+        else:
+            user_registered = "null"
+            used_char = cmd_args[0][0:len(wanted_char)]
+            command_word = cmd_args[0].lower()[len(wanted_char):]
+        if used_char != wanted_char:
+            continue
+
+        if command_word == 'ping':
+            sendmsg(message['replyto'], "{0}: PONG".format(message['nick']))
+        if command_word == 'help':
+            sendmsg(message['replyto'], message['nick'] +", \x02Help\x02: To Create a Clone: \x02!clone \x1fusername\x1f \x1fcloneip\x1f\x02 | To Delete a Clone: \x02!delclone \x1fusername\x1f\x02 | For Same Error: \x02!clonerestart\x02")
+        if command_word == 'clone':
+            access = acs_admin
+            with open(os.path.join('i18n', f"{userlang.get(message['userhost'], config['language'])}.json")) as fd:
+                i18n = json.load(fd)
+            if len(cmd_args) < 3:
+                sendmsg(message['replyto'], message['nick'] +": Syntax: !clone \x1fusername\x1f \x1fcloneip\x1f")	
+            else:
+                command = cmd_request
+
+        if command_word == 'delclone':
+            access = acs_admin
+            with open(os.path.join('i18n', f"{userlang.get(message['userhost'], config['language'])}.json")) as fd:
+                i18n = json.load(fd)
+            if len(cmd_args) < 2:
+                sendmsg(message['replyto'], message['nick'] +": Syntax: !deluser \x1fusername\x1f")
+            else:
+                znc_username = cmd_args[1]
+                command = cmd_deluser
+				
+        if command_word == 'clonerestart':
+            access = acs_admin
+            command = cmd_restart
+
+        if not command is None:
+            if access(message):
+                try:
+                    command(message, cmd_args[1], args)
+                except:
+                    command(message, cmd_args[1:])
+            else:
+                sendmsg(message['replyto'], message['nick'] +": Permission Denied")
