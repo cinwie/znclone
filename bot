@@ -229,6 +229,9 @@ def zncrequest(message, cmd_args):
     zncusersdb["users"][nick_formatted2.lower()]["isonline"] = False
     with open('zncusersdb.json', 'w') as b:
         json.dump(zncusersdb, b, indent=2)
+    cache[message['host']] = int(time.time())
+    with open('cache.json', 'w') as o:
+        json.dump(cache, o, indent=2)
     cache['lastrequest'] = int(time.time())
     with open('cache.json', 'w') as g:
         json.dump(cache, g, indent=2)
@@ -250,10 +253,28 @@ def cmd_request(message, cmd_args):
         pass
     if "#" not in message['replyto']:
         sendmsg(message['nick'], "{0} {1} {2}".format(i18n['join_channel_error'], config['reqchan'], i18n['to_use_request_command']))
+    elif user_registered == '-':
+        sendmsg(message['replyto'], message['nick'] +": {0} !request".format(i18n['identify_services_error']))
     elif len(cmd_args) <= 0:
         sendmsg(message['replyto'], message['nick'] +": {0} \x1f{1}\x1f".format(i18n['request_syntax'], i18n['username_without_comma']))
+    elif message['userhost'] in cache: # This 'elif' is for backwards compatibility with older databases.
+        if time.time() < cache[message['userhost']] + 10:
+            sendmsg(message['replyto'], message['nick'] +": {0}".format(i18n['requestthrottle_error']))
+        else:
+            zncrequest(message, cmd_args)
+    elif message['host'] in cache:
+        if time.time() < cache[message['host']] + 10 and not cache['already_alerted_bug']:
+            sendmsg(message['replyto'], message['nick'] +": {0}".format(i18n['requestthrottle_error']))
+        elif time.time() > cache[message['host']] + 10 and not cache['already_alerted_bug']:
+            zncrequest(message, cmd_args)
     elif cmd_args[0].lower() in zncuserlist['main']:
         sendmsg(message['replyto'], message['nick'] +": Error: The username {0} is already taken!".format(cmd_args[0]))
+    #elif cmd_args[0].lower() in zncusersdb['users']:
+         #if zncusersdb["users"][str(cmd_args[0]).lower()]["state"] == "Pending" or zncusersdb["users"][str(cmd_args[0]).lower()]["state"] == "Approved":
+             #sendmsg(message['replyto'], message['nick'] +": Error: The username {0} is already taken!".format(cmd_args[0]))
+         #else:
+             #zncrequest(message, cmd_args)
+
     elif " " in cmd_args[0] or "/" in cmd_args[0] or "[" in cmd_args[0] or "]" in cmd_args[0] or "|" in cmd_args[0]:
         sendmsg(message['replyto'], message['nick'] +": Error: Please enter a more valid username.")
     else:
